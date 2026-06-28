@@ -358,6 +358,33 @@ pub const ORACLE_RETRY_ATTEMPTS: u32 = 3;
 /// Oracle timeout seconds
 pub const ORACLE_TIMEOUT_SECONDS: u64 = 30;
 
+/// Outlier deviation threshold for multi-oracle consensus (500 basis points = 5%)
+///
+/// When aggregating quotes from multiple oracle sources (Pyth, Reflector, Band),
+/// any quote that deviates from the median by more than this threshold is rejected
+/// as an outlier. This prevents a single bad feed from skewing the consensus.
+///
+/// Safe range: 100-1000 basis points (1-10%). Below 1% may reject legitimate
+/// price variations. Above 10% may allow manipulation through outlier quotes.
+///
+/// Rationale: 5% threshold balances security with tolerance for legitimate
+/// price differences between oracle providers due to update timing and methodology.
+pub const ORACLE_OUTLIER_DEVIATION_THRESHOLD_BPS: u32 = 500;
+
+/// Default confidence weights for oracle providers in basis points (10000 = 100%)
+///
+/// These weights are used when computing weighted median of oracle quotes.
+/// Higher weight indicates higher confidence in that provider's accuracy.
+///
+/// Pyth: 4000 bps (40%) - High-frequency, institutional-grade data
+/// Reflector: 3500 bps (35%) - Primary Stellar oracle, reliable
+/// Band: 2500 bps (25%) - Decentralized but less established on Stellar
+///
+/// Note: Weights must sum to 10000 basis points (100%).
+pub const PYTH_ORACLE_WEIGHT_BPS: u32 = 4000;
+pub const REFLECTOR_ORACLE_WEIGHT_BPS: u32 = 3500;
+pub const BAND_ORACLE_WEIGHT_BPS: u32 = 2500;
+
 // ===== STORAGE CONSTANTS =====
 
 /// Storage key for admin address

@@ -1389,6 +1389,123 @@ impl OracleInstance {
     }
 }
 
+// ===== MULTI-ORACLE AGGREGATION =====
+
+/// Result from fetching a single oracle source for multi-oracle consensus.
+///
+/// This structure captures the result of attempting to fetch price data from
+/// a specific oracle provider, including success/failure status and the quote
+/// if available.
+#[derive(Clone, Debug)]
+pub struct OracleQuote {
+    /// The oracle provider that provided this quote
+    pub provider: OracleProvider,
+    /// The price quote from this oracle (if successful)
+    pub price: Option<i128>,
+    /// Whether this oracle source was successfully queried
+    pub success: bool,
+    /// Error message if the fetch failed
+    pub error: Option<String>,
+}
+
+/// Fetch quotes from all three oracle sources (Pyth, Reflector, Band) for consensus.
+///
+/// This function attempts to fetch price data from all three configured oracle sources.
+/// In WASM environments, fetching is done sequentially since true concurrency is not available.
+/// Each oracle fetch is attempted independently, so failures in one source don't affect others.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban environment
+/// * `feed_id` - The feed ID to query from all oracles
+/// * `pyth_address` - Contract address for Pyth oracle
+/// * `reflector_address` - Contract address for Reflector oracle
+/// * `band_address` - Contract address for Band oracle
+///
+/// # Returns
+///
+/// A vector of OracleQuote results from all three sources
+///
+/// # Example
+///
+/// ```rust
+/// # use soroban_sdk::{Env, Address, String};
+/// # use predictify_hybrid::oracles::MultiOracleAggregator;
+/// # let env = Env::default();
+///
+/// let quotes = MultiOracleAggregator::fetch_all_quotes(
+///     &env,
+///     &String::from_str(&env, "BTC/USD"),
+///     Address::generate(&env),
+///     Address::generate(&env),
+///     Address::generate(&env),
+/// );
+///
+/// for quote in quotes.iter() {
+///     match quote.price {
+///         Some(price) => println!("{:?}: ${}", quote.provider, price),
+///         None => println!("{:?}: Failed", quote.provider),
+///     }
+/// }
+/// ```
+pub struct MultiOracleAggregator;
+
+impl MultiOracleAggregator {
+    pub fn fetch_all_quotes(
+        env: &Env,
+        feed_id: &String,
+        pyth_address: Address,
+        reflector_address: Address,
+        band_address: Address,
+    ) -> Vec<OracleQuote> {
+        let mut quotes = Vec::new(env);
+
+        // Fetch from Pyth (may fail on Stellar)
+        let pyth_oracle = PythOracle::new(pyth_address.clone());
+        let pyth_result = pyth_oracle.get_price(env, feed_id);
+        quotes.push_back(OracleQuote {
+            provider: OracleProvider::pyth(),
+            price: pyth_result.ok(),
+            success: pyth_result.is_ok(),
+            error: if pyth_result.is_err() {
+                Some(String::from_str(env, "Pyth unavailable on Stellar"))
+            } else {
+                None
+            },
+        });
+
+        // Fetch from Reflector (primary Stellar oracle)
+        let reflector_oracle = ReflectorOracle::new(reflector_address.clone());
+        let reflector_result = reflector_oracle.get_price(env, feed_id);
+        quotes.push_back(OracleQuote {
+            provider: OracleProvider::reflector(),
+            price: reflector_result.ok(),
+            success: reflector_result.is_ok(),
+            error: if reflector_result.is_err() {
+                Some(String::from_str(env, "Reflector fetch failed"))
+            } else {
+                None
+            },
+        });
+
+        // Fetch from Band (may fail on Stellar)
+        let band_oracle = BandProtocolOracle::new(band_address.clone());
+        let band_result = band_oracle.get_price(env, feed_id);
+        quotes.push_back(OracleQuote {
+            provider: OracleProvider::band_protocol(),
+            price: band_result.ok(),
+            success: band_result.is_ok(),
+            error: if band_result.is_err() {
+                Some(String::from_str(env, "Band unavailable on Stellar"))
+            } else {
+                None
+            },
+        });
+
+        quotes
+    }
+}
+
 // ===== ORACLE UTILITIES =====
 
 /// Comprehensive utilities for oracle operations, price analysis, and market resolution.

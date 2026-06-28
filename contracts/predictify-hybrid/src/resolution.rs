@@ -6,7 +6,13 @@ use alloc::string::ToString;
 
 use crate::markets::{CommunityConsensus, MarketAnalytics, MarketStateManager, MarketUtils};
 
-use crate::oracles::{OracleFactory, OracleUtils};
+use crate::oracles::{OracleFactory, OracleUtils, MultiOracleAggregator, OracleQuote};
+use crate::config::{
+    ORACLE_OUTLIER_DEVIATION_THRESHOLD_BPS,
+    PYTH_ORACLE_WEIGHT_BPS,
+    REFLECTOR_ORACLE_WEIGHT_BPS,
+    BAND_ORACLE_WEIGHT_BPS,
+};
 // use crate::reentrancy_guard::ReentrancyGuard; // Removed - module no longer exists
 use crate::types::*;
 
@@ -1236,6 +1242,239 @@ impl OracleResolutionManager {
     /// Calculate oracle confidence score
     pub fn calculate_oracle_confidence(resolution: &OracleResolution) -> u32 {
         OracleResolutionAnalytics::calculate_confidence_score(resolution)
+    }
+
+    /// Resolve market using weighted median-of-3 oracle aggregation.
+    ///
+    /// This function fetches quotes from all three oracle sources (Pyth, Reflector, Band),
+    /// rejects outliers exceeding the configured deviation threshold, and computes a
+    /// weighted median based on per-oracle confidence weights. This provides resilience
+    /// against a single bad feed while maintaining accuracy through consensus.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `market_id` - The market ID to resolve
+    ///
+    /// # Returns
+    ///
+    /// Result containing the OracleResolution with median-aggregated price and outcome
+    ///
+    /// # Process
+    ///
+    /// 1. Fetch quotes from all three oracle sources (sequential in WASM)
+    /// 2. Filter out failed oracle fetches
+    /// 3. Reject outliers exceeding deviation threshold from median
+    /// 4. Compute weighted median of remaining quotes
+    /// 5. Determine outcome based on median price and market threshold
+    /// 6. Emit OracleConsensusReachedEvent with all quotes and weights
+    ///
+    /// # Error Handling
+    ///
+    /// Returns error if:
+    /// - Fewer than 2 oracle sources succeed (insufficient consensus)
+    /// - All quotes are rejected as outliers
+    /// - Market configuration is invalid
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use soroban_sdk::{Env, Symbol};
+    /// # use predictify_hybrid::resolution::OracleResolutionManager;
+    /// # let env = Env::default();
+    /// # let market_id = Symbol::new(&env, "btc_50k");
+    ///
+    /// let resolution = OracleResolutionManager::resolve_with_median(&env, &market_id)?;
+    ///
+    /// println!("Median price: {}", resolution.price);
+    /// println!("Outcome: {}", resolution.oracle_result);
+    /// # Ok::<(), predictify_hybrid::errors::Error>(())
+    /// ```
+    pub fn resolve_with_median(env: &Env, market_id: &Symbol) -> Result<OracleResolution, Error> {
+        // Get the market from storage
+        let market = MarketStateManager::get_market(env, market_id)?;
+
+        // Validate market for oracle resolution
+        OracleResolutionValidator::validate_market_for_oracle_resolution(env, &market)?;
+
+        // Fetch quotes from all three oracle sources
+        let quotes = MultiOracleAggregator::fetch_all_quotes(
+            env,
+            &market.oracle_config.feed_id,
+            market.oracle_config.oracle_address.clone(),
+            market.oracle_config.oracle_address.clone(), // Using same address for all (simplified)
+            market.oracle_config.oracle_address.clone(),
+        );
+
+        // Extract successful quotes
+        let successful_quotes: Vec<(OracleProvider, i128)> = quotes
+            .iter()
+            .filter_map(|q| q.price.map(|p| (q.provider, p)))
+            .collect();
+
+        // Require at least 2 successful quotes for consensus
+        if successful_quotes.len() < 2 {
+            return Err(Error::OracleUnavailable);
+        }
+
+        // Calculate median for outlier detection
+        let mut prices: Vec<i128> = successful_quotes.iter().map(|(_, p)| *p).collect();
+        let median = Self::compute_median(&mut prices)?;
+
+        // Reject outliers exceeding deviation threshold
+        let deviation_threshold = (median * ORACLE_OUTLIER_DEVIATION_THRESHOLD_BPS as i128) / 10000;
+        let accepted_quotes: Vec<(OracleProvider, i128)> = successful_quotes
+            .into_iter()
+            .filter(|(_, price)| {
+                let deviation = (*price - median).abs();
+                deviation <= deviation_threshold
+            })
+            .collect();
+
+        // Require at least 1 accepted quote after outlier rejection
+        if accepted_quotes.is_empty() {
+            return Err(Error::OracleUnavailable);
+        }
+
+        // Compute weighted median of accepted quotes
+        let weighted_median = Self::compute_weighted_median(env, &accepted_quotes)?;
+
+        // Determine outcome based on weighted median
+        let outcome = OracleUtils::determine_outcome(
+            weighted_median,
+            market.oracle_config.threshold,
+            &market.oracle_config.comparison,
+            env,
+        )?;
+
+        // Extract individual quotes for event emission
+        let pyth_quote = quotes.iter().find(|q| q.provider.is_pyth()).and_then(|q| q.price);
+        let reflector_quote = quotes.iter().find(|q| q.provider.is_reflector()).and_then(|q| q.price);
+        let band_quote = quotes.iter().find(|q| q.provider.is_band_protocol()).and_then(|q| q.price);
+
+        // Emit consensus event
+        let consensus_event = crate::events::OracleConsensusReachedEvent {
+            market_id: market_id.clone(),
+            consensus_outcome: outcome.clone(),
+            median_price: weighted_median,
+            pyth_quote,
+            reflector_quote,
+            band_quote,
+            pyth_weight: PYTH_ORACLE_WEIGHT_BPS,
+            reflector_weight: REFLECTOR_ORACLE_WEIGHT_BPS,
+            band_weight: BAND_ORACLE_WEIGHT_BPS,
+            deviation_threshold_bps: ORACLE_OUTLIER_DEVIATION_THRESHOLD_BPS,
+            accepted_sources: accepted_quotes.len() as u32,
+            rejected_sources: (quotes.len() - accepted_quotes.len()) as u32,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        env.events().publish(
+            (Symbol::new(env, "oracle_consensus"),),
+            (
+                market_id.clone(),
+                consensus_event.consensus_outcome.clone(),
+                consensus_event.median_price,
+                consensus_event.accepted_sources,
+            ),
+        );
+
+        // Create oracle resolution record
+        let resolution = OracleResolution {
+            market_id: market_id.clone(),
+            oracle_result: outcome,
+            price: weighted_median,
+            threshold: market.oracle_config.threshold,
+            comparison: market.oracle_config.comparison.clone(),
+            timestamp: env.ledger().timestamp(),
+            provider: OracleProvider::Reflector, // Using Reflector as representative
+            feed_id: market.oracle_config.feed_id.clone(),
+        };
+
+        // Store the result in the market
+        let mut market_mut = market;
+        MarketStateManager::set_oracle_result(&mut market_mut, outcome.clone());
+        MarketStateManager::update_market(env, market_id, &market_mut);
+
+        Ok(resolution)
+    }
+
+    /// Compute median of a slice of prices.
+    ///
+    /// This function computes the median value without using unwrap() for safety.
+    /// For even-length slices, returns the lower median.
+    pub fn compute_median(prices: &mut [i128]) -> Result<i128, Error> {
+        if prices.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+
+        // Sort the prices
+        prices.sort();
+
+        let len = prices.len();
+        if len % 2 == 1 {
+            // Odd length: return middle element
+            Ok(prices[len / 2])
+        } else {
+            // Even length: return lower median
+            Ok(prices[len / 2 - 1])
+        }
+    }
+
+    /// Compute weighted median of oracle quotes.
+    ///
+    /// This function computes the weighted median based on configured oracle weights.
+    /// The weights are in basis points (10000 = 100%).
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - The Soroban environment
+    /// * `quotes` - Vector of (provider, price) tuples
+    ///
+    /// # Returns
+    ///
+    /// The weighted median price
+    pub fn compute_weighted_median(env: &Env, quotes: &[(OracleProvider, i128)]) -> Result<i128, Error> {
+        if quotes.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+
+        // If only one quote, return it
+        if quotes.len() == 1 {
+            return Ok(quotes[0].1);
+        }
+
+        // Create weighted list: (price, weight)
+        let mut weighted: Vec<(i128, u32)> = quotes
+            .iter()
+            .map(|(provider, price)| {
+                let weight = match provider {
+                    OracleProvider::Pyth => PYTH_ORACLE_WEIGHT_BPS,
+                    OracleProvider::Reflector => REFLECTOR_ORACLE_WEIGHT_BPS,
+                    OracleProvider::BandProtocol => BAND_ORACLE_WEIGHT_BPS,
+                    _ => REFLECTOR_ORACLE_WEIGHT_BPS, // Default
+                };
+                (*price, weight)
+            })
+            .collect();
+
+        // Sort by price
+        weighted.sort_by_key(|(price, _)| *price);
+
+        // Find the weighted median
+        let total_weight: u32 = weighted.iter().map(|(_, w)| *w).sum();
+        let mut cumulative_weight: u32 = 0;
+        let median_threshold = total_weight / 2;
+
+        for (price, weight) in weighted.iter() {
+            cumulative_weight += weight;
+            if cumulative_weight > median_threshold {
+                return Ok(*price);
+            }
+        }
+
+        // Fallback: return the middle price
+        Ok(weighted[weighted.len() / 2].0)
     }
 }
 

@@ -47,6 +47,8 @@ mod metadata_limits_tests;
 mod monitoring;
 #[cfg(test)]
 mod multi_admin_multisig_tests;
+#[cfg(test)]
+mod median_aggregation_tests;
 mod oracles;
 mod performance_benchmarks;
 mod queries;

@@ -903,27 +903,40 @@ pub struct OracleValidationFailedEvent {
     /// Validation failure timestamp
     pub timestamp: u64,
 }
-/// Event emitted when multi-oracle consensus is reached.
+/// Event emitted when multi-oracle consensus is reached through median-of-3 aggregation.
 ///
-/// This event is emitted when multiple oracle sources agree on an outcome,
-/// providing enhanced security through consensus-based verification.
+/// This event is emitted when three oracle sources (Pyth, Reflector, Band) are queried
+/// and their quotes are aggregated using a weighted median algorithm. Outliers exceeding
+/// the configured deviation threshold are discarded before computing the final consensus.
+/// This provides enhanced security through consensus-based verification and resilience
+/// against single bad feeds.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OracleConsensusReachedEvent {
     /// Market ID
     pub market_id: Symbol,
-    /// Consensus outcome
+    /// Consensus outcome based on median price
     pub consensus_outcome: String,
-    /// Number of agreeing sources
-    pub agreeing_sources: u32,
-    /// Total sources consulted
-    pub total_sources: u32,
-    /// Agreement percentage
-    pub agreement_percentage: u32,
-    /// Average price across sources
-    pub average_price: i128,
-    /// Price variance (deviation indicator)
-    pub price_variance: i128,
+    /// Final median price after outlier rejection
+    pub median_price: i128,
+    /// Pyth oracle quote (if available and not rejected as outlier)
+    pub pyth_quote: Option<i128>,
+    /// Reflector oracle quote (if available and not rejected as outlier)
+    pub reflector_quote: Option<i128>,
+    /// Band oracle quote (if available and not rejected as outlier)
+    pub band_quote: Option<i128>,
+    /// Pyth oracle confidence weight (basis points, 10000 = 100%)
+    pub pyth_weight: u32,
+    /// Reflector oracle confidence weight (basis points, 10000 = 100%)
+    pub reflector_weight: u32,
+    /// Band oracle confidence weight (basis points, 10000 = 100%)
+    pub band_weight: u32,
+    /// Configured outlier deviation threshold (basis points)
+    pub deviation_threshold_bps: u32,
+    /// Number of sources that passed outlier rejection
+    pub accepted_sources: u32,
+    /// Number of sources rejected as outliers
+    pub rejected_sources: u32,
     /// Consensus timestamp
     pub timestamp: u64,
 }
